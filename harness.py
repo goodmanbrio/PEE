@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
 date created: 2026-08-04
-date updated: 2026-08-07
-date surroundings last checked: 2026-08-07
+date updated: 2026-08-08
+date surroundings last checked: 2026-08-08
 """
 import json
+import math
 import os
 import sys
 
 import openpyxl
 import requests
 
-from dateregex import is_date_like
+from dateregex import is_date_like, is_year_match
 
 HARNESS_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(HARNESS_DIR, ".env")
@@ -24,8 +25,16 @@ MAX_TOOL_CALLS = 40
 PEEK_MAX_CELLS = 50
 PEEK_ASCII_MAX_CELLS = 225
 MINIMAP_BIN = 10
-ROW_SCAN_CAP = 500
-COL_SCAN_CAP = 300
+# Row-count budget replaces the old flat ROW_SCAN_CAP/COL_SCAN_CAP pair (wsnSearch4.md
+# item 5): measured cost scales with rows scanned, not cell count — column width is
+# nearly free even at Excel's near-absolute column ceiling. No column cap.
+ROW_SCAN_BUDGET = 10_000
+# Payload cap, independent of the scan-depth budget above: how many values all_axis
+# returns, not how far it scans. wsnSearch4.md item 5 §1 "wrinkle".
+AXIS_VALUE_CAP = 500
+# peek_row/peek_col window radius and char safety net — wsnSearch4.md item 2 §2.
+PEEK_AXIS_WINDOW_RADIUS = 20
+PEEK_AXIS_CHAR_LIMIT = 1000
 MAX_TOOL_OUTPUT_CHARS = 6000
 BLOCK_MERGE_MAX_GAP = 3
 BLOCK_MERGE_MAX_ROWSUM = 20
@@ -46,22 +55,30 @@ def _matches(term, v):
     return bool(term) and isinstance(v, str) and term.lower() in v.lower()
 
 
-def _cell_flags(v, metric_term=None, entity_term=None):
-    """Independent (date, metric, entity) booleans for one cell — not priority-collapsed.
-    A cell can be true for more than one at once (e.g. "300mm wafer" matches metric and entity)."""
+def _year_matches(term, v):
+    return term is not None and is_year_match(v, term)
+
+
+def _cell_flags(v, metric_term=None, entity_term=None, year_term=None):
+    """Independent (date, metric, entity, year) booleans for one cell — not priority-
+    collapsed. A cell can be true for more than one at once (e.g. "300mm wafer" matches
+    metric and entity; a bare "2022" matches date and year)."""
     if v is None:
-        return (False, False, False)
-    return (is_date_like(v), _matches(metric_term, v), _matches(entity_term, v))
+        return (False, False, False, False)
+    return (is_date_like(v), _matches(metric_term, v), _matches(entity_term, v), _year_matches(year_term, v))
 
 
-def _cell_code(v, metric_term=None, entity_term=None):
-    """Single-letter priority code for one cell: blank > metric > entity > date > string/number/other."""
+def _cell_code(v, metric_term=None, entity_term=None, year_term=None):
+    """Single-letter priority code for one cell: blank > metric > entity > year > date >
+    string/number/other."""
     if v is None:
         return "."
     if _matches(metric_term, v):
         return "A"
     if _matches(entity_term, v):
         return "B"
+    if _year_matches(year_term, v):
+        return "C"
     if is_date_like(v):
         return "D"
     if isinstance(v, str):
@@ -153,6 +170,62 @@ def _merge_blocks(zones):
     return entries
 
 
+def _find_entry(entries, row, col):
+    for e in entries:
+        r0, r1 = e["rows"]
+        c0, c1 = e["cols"]
+        if r0 <= row <= r1 and c0 <= col <= c1:
+            return e
+    return None
+
+
+def _trim_to_char_limit(values_out, anchor_index, char_limit):
+    """Char safety net for peek_row/peek_col, independent of the span-based windowing —
+    fires even inside a <=41 block whose values happen to be long (wsnSearch4.md item 2
+    §2 step 6). Keeps the entries closest to the anchor, drops the rest."""
+    rendered = repr(values_out)
+    if len(rendered) <= char_limit:
+        return values_out, None
+    order = sorted(values_out.keys(), key=lambda k: abs(k - anchor_index))
+    trimmed = {}
+    total = 0
+    for k in order:
+        piece_len = len(repr({k: values_out[k]}))
+        if total + piece_len > char_limit:
+            break
+        trimmed[k] = values_out[k]
+        total += piece_len
+    if not trimmed:
+        return trimmed, "showing none (single value exceeds char limit)"
+    shown = sorted(trimmed.keys())
+    return trimmed, f"showing {shown[0]}-{shown[-1]}"
+
+
+def _clamp_window(r0, r1, c0, c1, cap):
+    """Clamp-on-overage for peek/peek_ascii (wsnSearch4.md item 1). Returns (r1, c1, note) —
+    r1/c1 unchanged and note=None when already within cap. Tie-break: rows==cols treats
+    cols as the axis to clamp."""
+    rows = r1 - r0 + 1
+    cols = c1 - c0 + 1
+    if rows * cols <= cap:
+        return r1, c1, None
+    cols_is_bigger = cols >= rows
+    bigger = cols if cols_is_bigger else rows
+    smaller = rows if cols_is_bigger else cols
+    if smaller <= cap:
+        new_bigger = cap // smaller
+        if cols_is_bigger:
+            r1_new, c1_new = r1, c0 + new_bigger - 1
+        else:
+            r1_new, c1_new = r0 + new_bigger - 1, c1
+    else:
+        # Degenerate: both axes individually exceed cap. A small square samples both
+        # dimensions instead of discarding one entirely.
+        side = math.isqrt(cap)
+        r1_new, c1_new = r0 + side - 1, c0 + side - 1
+    return r1_new, c1_new, f"too many cells! truncated to r1={r1_new}, c1={c1_new}"
+
+
 TOOLS = [
     {
         "type": "function",
@@ -160,18 +233,19 @@ TOOLS = [
             "name": "list_sheets",
             "description": (
                 "List visible sheet names (hidden sheets are not accessible — same as what an "
-                "analyst opening this file would see by default). If metric_term/entity_term are "
-                "given, also scans every visible sheet and reports raw D/A/B counts and scanned "
-                "rows/cols per sheet, so you can rank candidate sheets before opening any in "
-                "detail. Raw counts only, not a ranking score — a sheet can score highest simply "
-                "because the term is its own subject, not because it's the answer; weigh count "
-                "against sheet size yourself."
+                "analyst opening this file would see by default). If metric_term/entity_term/"
+                "year_term are given, also scans every visible sheet and reports raw D/A/B/C "
+                "counts and scanned rows/cols per sheet, so you can rank candidate sheets before "
+                "opening any in detail. Raw counts only, not a ranking score — a sheet can score "
+                "highest simply because the term is its own subject, not because it's the answer; "
+                "weigh count against sheet size yourself."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "metric_term": {"type": "string", "description": "optional fuzzy metric term to count matches for (adds an A count per sheet)"},
                     "entity_term": {"type": "string", "description": "optional fuzzy entity term to count matches for (adds a B count per sheet)"},
+                    "year_term": {"type": "integer", "description": "optional target year to count matches for (adds a C count per sheet) — anchor to check, not a settled answer"},
                 },
                 "required": [],
             },
@@ -195,12 +269,10 @@ TOOLS = [
             "name": "map_block",
             "description": (
                 "Default first structural call after list_sheets. Finds every table block on a "
-                "sheet (column bands split by blank columns, then row blocks split by blank rows "
+                "sheet (split by blank columns/rows"
                 "within each band) and renders them as a compact line list: one entry per block, "
-                "or per merged run of blocks separated by only 1-3 blank rows (shown as a "
-                "dash-range block number, e.g. '1-3' — never silently renumbered). Each entry "
-                "gives its exact row/col range and raw D/A/B counts over that range. Call this "
-                "before map_bin — only fall back to map_bin if this flat list doesn't resolve a "
+                "or cluster of small blocks. Each entry gives its row/col range and raw D/A/B/C counts within."
+                "Call before map_bin — only fall back to map_bin if this flat list doesn't resolve a "
                 "spatial/relative-position question (role-swap headers, transposed axes, adjacent "
                 "column-band comparison)."
             ),
@@ -210,6 +282,7 @@ TOOLS = [
                     "sheet": {"type": "string"},
                     "metric_term": {"type": "string", "description": "optional fuzzy metric term; adds an A count per block"},
                     "entity_term": {"type": "string", "description": "optional fuzzy entity term; adds a B count per block"},
+                    "year_term": {"type": "integer", "description": "optional target year; adds a C count per block — anchor to check, not a settled answer"},
                 },
                 "required": ["sheet"],
             },
@@ -224,11 +297,11 @@ TOOLS = [
                 "for spatial/relative-position reasoning (role-swap headers, transposed axes, "
                 "adjacent column-band comparison) — a grid conveys that better than a line list. "
                 "Returns an ascii minimap binned 10x10 cells per bin. Each bin renders as a "
-                "4-character code [structural][D][A][B]: structural is '.' blank bin, ':' content "
-                "not a corner, '#' a block's exact top-left corner; D/A/B are '-' or the letter if "
-                "a date-like/metric-match/entity-match cell exists anywhere in that bin. A blank "
-                "bin is always '.---'. Real row/col numbers label each bin boundary — use them "
-                "directly as coordinates into peek_ascii."
+                "5-character code [structural][D][A][B][C]: structural is '.' blank bin, ':' content "
+                "not a corner, '#' a block's exact top-left corner; D/A/B/C are '-' or the letter if "
+                "a date-like/metric-match/entity-match/year-match cell exists anywhere in that bin. "
+                "A blank bin is always '.----'. Real row/col numbers label each bin boundary — use "
+                "them directly as coordinates into peek_ascii."
             ),
             "parameters": {
                 "type": "object",
@@ -236,6 +309,7 @@ TOOLS = [
                     "sheet": {"type": "string"},
                     "metric_term": {"type": "string", "description": "optional fuzzy metric term; sets the A flag on bins containing a match"},
                     "entity_term": {"type": "string", "description": "optional fuzzy entity term; sets the B flag on bins containing a match"},
+                    "year_term": {"type": "integer", "description": "optional target year; sets the C flag on bins containing a match — anchor to check, not a settled answer"},
                 },
                 "required": ["sheet"],
             },
@@ -248,12 +322,13 @@ TOOLS = [
             "description": (
                 "Render the cell-type grid (not real values) for a bounded window at full resolution, "
                 "no binning. One letter per cell, priority order: '.' blank, 'A' metric fuzzy-match, "
-                "'B' entity fuzzy-match, 'D' date-like (regex match or native datetime dtype), "
-                "'S' string, 'N' number, '?' other — query-relevance outranks generic type info. "
-                "Real row/col numbers label the grid. Use this to narrow in on a map_block/map_bin "
-                "flag before reading real values with peek. HARD CAP: "
-                "(r1-r0+1)*(c1-c0+1) must be <= 225 — compute this before calling. Fails with a "
-                "ready-to-use suggested window if you exceed it."
+                "'B' entity fuzzy-match, 'C' year match, 'D' date-like (regex match or native datetime "
+                "dtype), 'S' string, 'N' number, '?' other — query-relevance outranks generic type "
+                "info. Real row/col numbers label the grid. Use this to narrow in on a map_block/"
+                "map_bin flag before reading real values with peek. Combined cap: "
+                f"(r1-r0+1)*(c1-c0+1) should be <= {PEEK_ASCII_MAX_CELLS} — over that, the window is "
+                "clamped (bigger axis cut first) and the response carries a 'note' naming the actual "
+                "range shown, not rejected."
             ),
             "parameters": {
                 "type": "object",
@@ -265,6 +340,7 @@ TOOLS = [
                     "c1": {"type": "integer"},
                     "metric_term": {"type": "string", "description": "optional fuzzy metric term; renders matching cells as 'A'"},
                     "entity_term": {"type": "string", "description": "optional fuzzy entity term; renders matching cells as 'B'"},
+                    "year_term": {"type": "integer", "description": "optional target year; renders matching cells as 'C' — anchor to check, not a settled answer"},
                 },
                 "required": ["sheet", "r0", "r1", "c0", "c1"],
             },
@@ -274,7 +350,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "peek",
-            "description": "Read real values in a small window. Returns {\"rows\": {row_number: {col_number: value}}} — every value is keyed by its real row/col number, not array position; don't count list entries to find a column. HARD CAP: (r1-r0+1)*(c1-c0+1) must be <= 50 — compute this before calling. Fails with a ready-to-use suggested window if you exceed it.",
+            "description": (
+                "Read real values in a small window. Returns {\"rows\": {row_number: {col_number: "
+                "value}}} — every value is keyed by its real row/col number, not array position; "
+                f"don't count list entries to find a column. Combined cap: (r1-r0+1)*(c1-c0+1) should "
+                f"be <= {PEEK_MAX_CELLS} — over that, the window is clamped (bigger axis cut first) "
+                "and the response carries a 'note' naming the actual range shown, not rejected."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -291,8 +373,66 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "read_axis",
-            "description": "Dump every non-blank value along one full row or column. kind is 'row' or 'col'. Use once peek has confirmed which row/column is the axis you need.",
+            "name": "peek_col",
+            "description": (
+                "Confirm a lineitem/column placement against its neighbors without dumping a whole "
+                "axis: anchor on one cell, get every value in that cell's column across its "
+                "containing table block's row range (block found the same way map_block finds one — "
+                "no need to call map_block first). Blocks <=41 rows return in full; bigger blocks "
+                "window +/-20 rows around the anchor; no block detected falls back to the same "
+                "+/-20 window. Sparse output ({\"values\": {row_number: value}}, blanks omitted) plus "
+                "a 'note' whenever the window was narrowed, the anchor's own column is blank "
+                "throughout, or a further char-length safety net trimmed it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sheet": {"type": "string"},
+                    "row": {"type": "integer", "description": "anchor cell's row"},
+                    "col": {"type": "integer", "description": "anchor cell's column — the column being confirmed"},
+                },
+                "required": ["sheet", "row", "col"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "peek_row",
+            "description": (
+                "Confirm a period/header placement against its neighbors without dumping a whole "
+                "axis: anchor on one cell, get every value in that cell's row across its containing "
+                "table block's column range (block found the same way map_block finds one — no need "
+                "to call map_block first). Blocks <=41 cols return in full; bigger blocks window "
+                "+/-20 cols around the anchor; no block detected falls back to the same +/-20 "
+                "window. Sparse output ({\"values\": {col_number: value}}, blanks omitted) plus a "
+                "'note' whenever the window was narrowed, the anchor's own row is blank throughout, "
+                "or a further char-length safety net trimmed it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sheet": {"type": "string"},
+                    "row": {"type": "integer", "description": "anchor cell's row — the row being confirmed"},
+                    "col": {"type": "integer", "description": "anchor cell's column"},
+                },
+                "required": ["sheet", "row", "col"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "all_axis",
+            "description": (
+                "Dump every non-blank value along one full row or column — the deliberate full-dump "
+                "option for when the whole axis is genuinely needed (prefer peek_row/peek_col for a "
+                "targeted neighbor check). kind is 'row' or 'col'. kind='row' scans the full true "
+                "column count (column width is cheap regardless of size); kind='col' scans up to "
+                f"{ROW_SCAN_BUDGET} rows. Returned values are capped at {AXIS_VALUE_CAP} regardless "
+                "of kind — a 'note' names whichever constraint (scan depth or payload size) actually "
+                "limited the response."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -348,41 +488,49 @@ class Workbook:
         if self.wb[sheet].sheet_state != "visible":
             raise ValueError(f"sheet '{sheet}' is hidden and not accessible — same as what an analyst opening this file would see")
 
-    def _scan(self, sheet):
+    def _scan(self, sheet, row_budget=ROW_SCAN_BUDGET):
         ws = self.wb[sheet]
         true_max_row = ws.max_row
         true_max_col = ws.max_column
-        max_row = min(true_max_row, ROW_SCAN_CAP)
-        max_col = min(true_max_col, COL_SCAN_CAP)
+        max_row = min(true_max_row, row_budget)
+        max_col = true_max_col  # no column cap — column width is nearly free to scan
         values = [list(r) for r in ws.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col, values_only=True)]
         n_rows = len(values)
         n_cols = len(values[0]) if n_rows else 0
         return values, n_rows, n_cols, true_max_row, true_max_col
 
-    def list_sheets(self, metric_term=None, entity_term=None):
+    def list_sheets(self, metric_term=None, entity_term=None, year_term=None):
         results = []
+        clamped_sheets = []
         for name in self.wb.sheetnames:
             ws = self.wb[name]
             if ws.sheet_state != "visible":
                 continue
             values, n_rows, n_cols, true_max_row, true_max_col = self._scan(name)
             entry = {"name": name, "scanned_rows": n_rows, "scanned_cols": n_cols}
-            d = a = b = 0
+            d = a = b = c = 0
             for row in values:
                 for v in row:
-                    date, metric, entity = _cell_flags(v, metric_term, entity_term)
+                    date, metric, entity, year = _cell_flags(v, metric_term, entity_term, year_term)
                     d += date
                     a += metric
                     b += entity
+                    c += year
             entry["D"] = d
             if metric_term is not None:
                 entry["A"] = a
             if entity_term is not None:
                 entry["B"] = b
-            if true_max_row > ROW_SCAN_CAP or true_max_col > COL_SCAN_CAP:
-                entry["note"] = f"scan bounded to {ROW_SCAN_CAP} rows x {COL_SCAN_CAP} cols; counts may understate this sheet's real extent"
+            if year_term is not None:
+                entry["C"] = c
+            if true_max_row > n_rows:
+                entry["note"] = f"{name} not fully scanned, {true_max_row - n_rows} rows remaining"
+                clamped_sheets.append(name)
             results.append(entry)
-        return results
+        output = {"sheets": results}
+        if clamped_sheets:
+            output["sheets_not_fully_scanned"] = clamped_sheets
+        return output
 
     def get_dims(self, sheet):
         self._check_visible(sheet)
@@ -393,7 +541,7 @@ class Workbook:
             "note": "upper bound only; formatting artifacts often overstate real extent — confirm with map_block or map_bin",
         }
 
-    def map_block(self, sheet, metric_term=None, entity_term=None):
+    def map_block(self, sheet, metric_term=None, entity_term=None, year_term=None):
         self._check_visible(sheet)
         values, n_rows, n_cols, true_max_row, true_max_col = self._scan(sheet)
         if not n_cols:
@@ -407,32 +555,33 @@ class Workbook:
             num_str = str(e["nums"][0]) if len(e["nums"]) == 1 else f"{e['nums'][0]}-{e['nums'][-1]}"
             r0, r1 = e["rows"]
             c0, c1 = e["cols"]
-            d = a = b = 0
+            d = a = b = c = 0
             for r in range(r0, r1 + 1):
-                for c in range(c0, c1 + 1):
-                    date, metric, entity = _cell_flags(values[r - 1][c - 1], metric_term, entity_term)
+                for cc in range(c0, c1 + 1):
+                    date, metric, entity, year = _cell_flags(values[r - 1][cc - 1], metric_term, entity_term, year_term)
                     d += date
                     a += metric
                     b += entity
+                    c += year
             rows_out.append([
                 num_str,
                 str(r0) if r0 == r1 else f"{r0}-{r1}",
                 str(c0) if c0 == c1 else f"{c0}-{c1}",
-                d, a, b,
+                d, a, b, c,
             ])
 
-        table = _render_table(["block", "rows", "cols", "D", "A", "B"], rows_out)
+        table = _render_table(["block", "rows", "cols", "D", "A", "B", "C"], rows_out)
         result = {
             "blocks": table,
-            "legend": "D date-like count  A metric-match count  B entity-match count — raw counts over each entry's true row/col extent",
+            "legend": "D date-like count  A metric-match count  B entity-match count  C year-match count — raw counts over each entry's true row/col extent",
             "scanned_rows": n_rows,
             "scanned_cols": n_cols,
         }
-        if true_max_row > ROW_SCAN_CAP or true_max_col > COL_SCAN_CAP:
-            result["note"] = f"scan bounded to {ROW_SCAN_CAP} rows x {COL_SCAN_CAP} cols; re-run peek_ascii/peek beyond this if needed"
+        if true_max_row > n_rows:
+            result["note"] = f"{sheet} not fully scanned, {true_max_row - n_rows} rows remaining"
         return result
 
-    def map_bin(self, sheet, metric_term=None, entity_term=None):
+    def map_bin(self, sheet, metric_term=None, entity_term=None, year_term=None):
         self._check_visible(sheet)
         values, n_rows, n_cols, true_max_row, true_max_col = self._scan(sheet)
         if not n_cols:
@@ -460,17 +609,18 @@ class Workbook:
                 else:
                     structural = ":"
                 if structural == ".":
-                    code = ".---"
+                    code = ".----"
                 else:
-                    has_d = has_a = has_b = False
+                    has_d = has_a = has_b = has_c = False
                     for v in cell_vals:
-                        date, metric, entity = _cell_flags(v, metric_term, entity_term)
+                        date, metric, entity, year = _cell_flags(v, metric_term, entity_term, year_term)
                         has_d = has_d or date
                         has_a = has_a or metric
                         has_b = has_b or entity
-                        if has_d and has_a and has_b:
+                        has_c = has_c or year
+                        if has_d and has_a and has_b and has_c:
                             break
-                    code = structural + ("D" if has_d else "-") + ("A" if has_a else "-") + ("B" if has_b else "-")
+                    code = structural + ("D" if has_d else "-") + ("A" if has_a else "-") + ("B" if has_b else "-") + ("C" if has_c else "-")
                 srow.append(code)
             symbol_rows.append(srow)
         col_labels = [bc * MINIMAP_BIN + 1 for bc in range(n_bin_cols)]
@@ -479,63 +629,38 @@ class Workbook:
         result = {
             "minimap": minimap,
             "legend": (
-                "4-char bin code [structural][D][A][B]. structural: '.' blank bin  ':' content, "
-                "not a corner  '#' block top-left corner. D/A/B: letter if a date-like/metric-match/"
-                "entity-match cell exists anywhere in the bin, else '-'. Blank bin is always '.---'. "
-                "(bin = 10x10 cells)"
+                "5-char bin code [structural][D][A][B][C]. structural: '.' blank bin  ':' content, "
+                "not a corner  '#' block top-left corner. D/A/B/C: letter if a date-like/metric-match/"
+                "entity-match/year-match cell exists anywhere in the bin, else '-'. Blank bin is "
+                "always '.----'. (bin = 10x10 cells)"
             ),
             "scanned_rows": n_rows,
             "scanned_cols": n_cols,
         }
-        if true_max_row > ROW_SCAN_CAP or true_max_col > COL_SCAN_CAP:
-            result["note"] = f"scan bounded to {ROW_SCAN_CAP} rows x {COL_SCAN_CAP} cols; re-run peek_ascii/peek beyond this if needed"
+        if true_max_row > n_rows:
+            result["note"] = f"{sheet} not fully scanned, {true_max_row - n_rows} rows remaining"
         return result
 
-    def peek_ascii(self, sheet, r0, r1, c0, c1, metric_term=None, entity_term=None):
+    def peek_ascii(self, sheet, r0, r1, c0, c1, metric_term=None, entity_term=None, year_term=None):
         self._check_visible(sheet)
-        n_cells = (r1 - r0 + 1) * (c1 - c0 + 1)
-        if n_cells > PEEK_ASCII_MAX_CELLS:
-            n_cols_req = c1 - c0 + 1
-            n_rows_req = r1 - r0 + 1
-            if n_cols_req <= PEEK_ASCII_MAX_CELLS:
-                max_rows = max(1, PEEK_ASCII_MAX_CELLS // n_cols_req)
-                suggested = {"r0": r0, "r1": min(r1, r0 + max_rows - 1), "c0": c0, "c1": c1}
-            else:
-                max_cols = max(1, PEEK_ASCII_MAX_CELLS // max(1, n_rows_req))
-                suggested = {"r0": r0, "r1": r0, "c0": c0, "c1": min(c1, c0 + max_cols - 1)}
-            return {
-                "error": f"requested {n_cells} cells exceeds the {PEEK_ASCII_MAX_CELLS}-cell cap "
-                         f"((r1-r0+1)*(c1-c0+1) must be <= {PEEK_ASCII_MAX_CELLS}). Narrow the range.",
-                "suggested_window": suggested,
-            }
+        r1c, c1c, note = _clamp_window(r0, r1, c0, c1, PEEK_ASCII_MAX_CELLS)
         ws = self.wb[sheet]
-        rows = list(ws.iter_rows(min_row=r0, max_row=r1, min_col=c0, max_col=c1, values_only=True))
-        symbol_rows = [[_cell_code(v, metric_term, entity_term) for v in row] for row in rows]
-        grid = _render_grid(symbol_rows, list(range(r0, r1 + 1)), list(range(c0, c1 + 1)))
-        return {
+        rows = list(ws.iter_rows(min_row=r0, max_row=r1c, min_col=c0, max_col=c1c, values_only=True))
+        symbol_rows = [[_cell_code(v, metric_term, entity_term, year_term) for v in row] for row in rows]
+        grid = _render_grid(symbol_rows, list(range(r0, r1c + 1)), list(range(c0, c1c + 1)))
+        result = {
             "grid": grid,
-            "legend": ". blank  A metric-match  B entity-match  D date-like  S string  N number  ? other (priority: A > B > D > S/N/?)",
+            "legend": ". blank  A metric-match  B entity-match  C year-match  D date-like  S string  N number  ? other (priority: A > B > C > D > S/N/?)",
         }
+        if note:
+            result["note"] = note
+        return result
 
     def peek(self, sheet, r0, r1, c0, c1):
         self._check_visible(sheet)
-        n_cells = (r1 - r0 + 1) * (c1 - c0 + 1)
-        if n_cells > PEEK_MAX_CELLS:
-            n_cols_req = c1 - c0 + 1
-            n_rows_req = r1 - r0 + 1
-            if n_cols_req <= PEEK_MAX_CELLS:
-                max_rows = max(1, PEEK_MAX_CELLS // n_cols_req)
-                suggested = {"r0": r0, "r1": min(r1, r0 + max_rows - 1), "c0": c0, "c1": c1}
-            else:
-                max_cols = max(1, PEEK_MAX_CELLS // max(1, n_rows_req))
-                suggested = {"r0": r0, "r1": r0, "c0": c0, "c1": min(c1, c0 + max_cols - 1)}
-            return {
-                "error": f"requested {n_cells} cells exceeds the {PEEK_MAX_CELLS}-cell cap "
-                         f"((r1-r0+1)*(c1-c0+1) must be <= {PEEK_MAX_CELLS}). Narrow the range.",
-                "suggested_window": suggested,
-            }
+        r1c, c1c, note = _clamp_window(r0, r1, c0, c1, PEEK_MAX_CELLS)
         ws = self.wb[sheet]
-        rows = list(ws.iter_rows(min_row=r0, max_row=r1, min_col=c0, max_col=c1, values_only=True))
+        rows = list(ws.iter_rows(min_row=r0, max_row=r1c, min_col=c0, max_col=c1c, values_only=True))
         result = {"rows": {r0 + i: {c0 + j: v for j, v in enumerate(row)} for i, row in enumerate(rows)}}
         error_count = sum(1 for row in rows for v in row if is_excel_error(v))
         if error_count:
@@ -543,21 +668,115 @@ class Workbook:
                 f"{error_count} cell(s) in this window are formula errors (#NAME?/#DIV/0!/etc.) — "
                 f"likely broken external data links, not real data"
             )
+        if note:
+            result["note"] = note
         return result
 
-    def read_axis(self, sheet, kind, index):
+    def _peek_axis(self, sheet, row, col, fixed_is_col):
+        """Shared implementation for peek_col (fixed_is_col=True) and peek_row
+        (fixed_is_col=False). wsnSearch4.md item 2 §2."""
+        self._check_visible(sheet)
+        values, n_rows, n_cols, true_max_row, true_max_col = self._scan(sheet)
+        # The anchor's fixed axis (its own column for peek_col, its own row for
+        # peek_row) indexes the scanned matrix directly, unwindowed — out-of-range
+        # here would otherwise raise before any note could explain why.
+        if fixed_is_col and not (1 <= col <= n_cols):
+            return {"values": {}, "note": f"column {col} is outside the sheet's scanned extent (1-{n_cols})"}
+        if not fixed_is_col and not (1 <= row <= n_rows):
+            return {"values": {}, "note": f"row {row} is outside the sheet's scanned extent (1-{n_rows})"}
+        entries = _merge_blocks(_detect_blocks(values, n_rows, n_cols))
+        entry = _find_entry(entries, row, col)
+        note = None
+        if entry is None:
+            if fixed_is_col:
+                lo = max(1, row - PEEK_AXIS_WINDOW_RADIUS)
+                hi = min(n_rows, row + PEEK_AXIS_WINDOW_RADIUS)
+            else:
+                lo = max(1, col - PEEK_AXIS_WINDOW_RADIUS)
+                hi = min(n_cols, col + PEEK_AXIS_WINDOW_RADIUS)
+            # Anchor coordinate itself beyond the scanned extent (e.g. col=9999 on a
+            # 48-col sheet) makes lo>hi here — collapse to the nearest valid edge
+            # instead of reporting a backwards range.
+            if lo > hi:
+                lo = hi
+            note = f"no block detected, showing {lo}-{hi}"
+        else:
+            r0, r1 = entry["rows"]
+            c0, c1 = entry["cols"]
+            if fixed_is_col:
+                span = r1 - r0 + 1
+                if span <= 2 * PEEK_AXIS_WINDOW_RADIUS + 1:
+                    lo, hi = r0, r1
+                else:
+                    lo = max(r0, row - PEEK_AXIS_WINDOW_RADIUS)
+                    hi = min(r1, row + PEEK_AXIS_WINDOW_RADIUS)
+                    note = f"block spans {span} rows, showing {lo}-{hi} centered on the requested cell"
+            else:
+                span = c1 - c0 + 1
+                if span <= 2 * PEEK_AXIS_WINDOW_RADIUS + 1:
+                    lo, hi = c0, c1
+                else:
+                    lo = max(c0, col - PEEK_AXIS_WINDOW_RADIUS)
+                    hi = min(c1, col + PEEK_AXIS_WINDOW_RADIUS)
+                    note = f"block spans {span} cols, showing {lo}-{hi} centered on the requested cell"
+
+        values_out = {}
+        if fixed_is_col:
+            for r in range(lo, hi + 1):
+                v = values[r - 1][col - 1]
+                if v is not None:
+                    values_out[r] = v
+            anchor_index = row
+        else:
+            for cc in range(lo, hi + 1):
+                v = values[row - 1][cc - 1]
+                if v is not None:
+                    values_out[cc] = v
+            anchor_index = col
+
+        values_out, trim_note = _trim_to_char_limit(values_out, anchor_index, PEEK_AXIS_CHAR_LIMIT)
+        if trim_note:
+            note = trim_note
+        elif not values_out:
+            axis_word = "column" if fixed_is_col else "row"
+            note = f"{axis_word} {col if fixed_is_col else row} is blank throughout the {lo}-{hi} range checked"
+
+        result = {"values": values_out}
+        if note:
+            result["note"] = note
+        return result
+
+    def peek_col(self, sheet, row, col):
+        return self._peek_axis(sheet, row, col, fixed_is_col=True)
+
+    def peek_row(self, sheet, row, col):
+        return self._peek_axis(sheet, row, col, fixed_is_col=False)
+
+    def all_axis(self, sheet, kind, index):
         self._check_visible(sheet)
         ws = self.wb[sheet]
+        note = None
         if kind == "row":
-            max_col = min(ws.max_column, COL_SCAN_CAP)
-            vals = list(ws.iter_rows(min_row=index, max_row=index, min_col=1, max_col=max_col, values_only=True))[0]
+            true_max_col = ws.max_column
+            vals = list(ws.iter_rows(min_row=index, max_row=index, min_col=1, max_col=true_max_col, values_only=True))[0]
         elif kind == "col":
-            max_row = min(ws.max_row, ROW_SCAN_CAP)
+            true_max_row = ws.max_row
+            max_row = min(true_max_row, ROW_SCAN_BUDGET)
             vals = [row[0] for row in ws.iter_rows(min_row=1, max_row=max_row, min_col=index, max_col=index, values_only=True)]
+            if true_max_row > max_row:
+                note = f"axis not fully scanned, {true_max_row - max_row} rows remaining"
         else:
             return {"error": "kind must be 'row' or 'col'"}
 
         values = {i + 1: v for i, v in enumerate(vals) if v is not None}
+        if len(values) > AXIS_VALUE_CAP:
+            total_found = len(values)
+            keep = sorted(values.keys())[:AXIS_VALUE_CAP]
+            values = {k: values[k] for k in keep}
+            # Actual final constraint on what's returned wins over the scan-depth note,
+            # same precedent as item 2 §2 step 6 (char net overwrites span note).
+            note = f"too many values! truncated to {AXIS_VALUE_CAP} of {total_found} found"
+
         result = {"values": values}
         warnings = []
         if kind == "col" and values:
@@ -572,6 +791,8 @@ class Workbook:
             )
         if warnings:
             result["warnings"] = warnings
+        if note:
+            result["note"] = note
         return result
 
     def read_cell(self, sheet, row, col):
@@ -613,7 +834,9 @@ def run(task, model, xlsx_path, max_tool_calls=MAX_TOOL_CALLS):
         "map_bin": lambda **kw: workbook.map_bin(**kw),
         "peek_ascii": lambda **kw: workbook.peek_ascii(**kw),
         "peek": lambda **kw: workbook.peek(**kw),
-        "read_axis": lambda **kw: workbook.read_axis(**kw),
+        "peek_col": lambda **kw: workbook.peek_col(**kw),
+        "peek_row": lambda **kw: workbook.peek_row(**kw),
+        "all_axis": lambda **kw: workbook.all_axis(**kw),
         "read_cell": lambda **kw: workbook.read_cell(**kw),
     }
 
