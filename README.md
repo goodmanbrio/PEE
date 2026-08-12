@@ -1,7 +1,7 @@
 ---
 Created: 2026-08-11
-Updated: 2026-08-11
-Last checked: 2026-08-11
+Updated: 2026-08-12
+Last checked: 2026-08-12
 ---
 
 # PEE — Poony Excel Explorer
@@ -13,16 +13,24 @@ scaffolding, not a deliverable in its own right.
 
 ## The tools
 
-Ten tools, defined in `harness.py`'s `TOOLS` schema and `Workbook` class, callable by any agent
-harness that speaks OpenAI-style function calling:
+Thirteen tools, defined in `harness.py`'s `TOOLS` schema and `Workbook` class, callable by any
+agent harness that speaks OpenAI-style function calling. Number cell values are always shown
+capped to 3 significant figures — a display cap, not the real stored precision.
 
+- `set_terms` — fix a metric/entity/year term once for the rest of the session; the tools below
+  fall back to it whenever their own term args are omitted.
 - `list_sheets` — visible sheet names, optionally scanned for metric/entity/year term matches to
   rank candidate sheets before opening any in detail.
 - `get_dims` — a sheet's reported max row/col. Upper bound only.
 - `map_block` — every table block on a sheet (blank-row/blank-column-delimited), with match counts
-  per block. Default first structural call.
+  per block, plus AB-run/CD-run: candidate lineitem/period axes found directly in that block, so a
+  confirmed candidate can skip straight to `check_axes` instead of a blind `peek_ascii` sweep.
+  Default first structural call.
 - `map_bin` — coarse whole-sheet minimap, for spatial/relative-position questions `map_block`'s
   flat list can't resolve (role-swap headers, transposed axes, adjacent column-band comparison).
+- `check_axes` — confirm a `map_block`-surfaced axis candidate is real: renders the block with the
+  candidate row/column's actual values shown, everything else as a type flag.
+- `peek_axes` — read a confirmed candidate axis's own values directly, no rendering, no flags.
 - `peek_ascii` — full-resolution cell-type grid (not real values) for a bounded window.
 - `peek` — real values in a small window.
 - `peek_row` / `peek_col` — confirm one lineitem's or period's neighbors without a whole-axis dump.
