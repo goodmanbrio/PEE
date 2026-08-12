@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 date created: 2026-08-04
-date updated: 2026-08-08
-date surroundings last checked: 2026-08-08
+date updated: 2026-08-11
+date surroundings last checked: 2026-08-11
 """
 import json
 import math
@@ -38,6 +38,19 @@ PEEK_AXIS_CHAR_LIMIT = 1000
 MAX_TOOL_OUTPUT_CHARS = 6000
 BLOCK_MERGE_MAX_GAP = 3
 BLOCK_MERGE_MAX_ROWSUM = 20
+# map_block's AB-run/CD-run detector — wsnSearch5.md item 2.
+RUN_LENGTH_THRESHOLD = 3
+CANDIDATE_CAP = 5
+SEQ_YEAR_MIN, SEQ_YEAR_MAX = 1980, 2035
+# Display formatting only — wsnSearch5.md item 1. Significant figures, not decimal places: a
+# fixed decimal-place cap keeps 7 sig figs on a value like 446.08 but only 1-2 on a sub-1 value
+# like 0.009499211388800962 (rounds to 0.009, a 5.26% error — enough to fail a 0.5%-tolerance
+# grading check even when the exact right cell was read). wsnSearch5_testlog.md q04.
+NUMBER_DISPLAY_SIGFIGS = 3
+
+# set_terms (wsnSearch5.md item 4) needs a default distinguishable from an explicit
+# None — None is a legitimate value meaning "clear this term".
+_UNSET = object()
 
 EXCEL_ERRORS = {"#NULL!", "#DIV/0!", "#VALUE!", "#REF!", "#NAME?", "#NUM!", "#N/A", "#GETTING_DATA"}
 
@@ -49,6 +62,47 @@ PRICE_PER_MTOK_OUTPUT = 0.87
 
 def is_excel_error(v):
     return isinstance(v, str) and v in EXCEL_ERRORS
+
+
+def _round_display(v):
+    """Cap a displayed number cell to NUMBER_DISPLAY_SIGFIGS significant figures — wsnSearch5.md
+    item 1. Prevents payload bloat on cells like 47.83973533973534, and (unlike a fixed
+    decimal-place cap) stays accurate on sub-1 values like 0.009499211388800962. Ints/strings/
+    None pass through unchanged; 0.0 has no sig-fig position and passes through as-is."""
+    if not isinstance(v, float):
+        return v
+    if v == 0.0:
+        return v
+    digits = NUMBER_DISPLAY_SIGFIGS - int(math.floor(math.log10(abs(v)))) - 1
+    return round(v, digits)
+
+
+def _resolve_term(explicit, stored):
+    """Session-term fallback for map_block/peek_ascii/list_sheets/map_bin — wsnSearch5.md
+    item 4. Omitted at call time (_UNSET) falls back to the set_terms default; an explicit
+    value (including None) applies to this call only and doesn't touch the stored default."""
+    return stored if explicit is _UNSET else explicit
+
+
+def _parse_range(s):
+    """'3-6' -> (3, 6); '3' -> (3, 3). rows/cols block-range strings, always copied verbatim
+    off a map_block output row — check_axes/peek_axes item 3a/3b contract."""
+    s = str(s).strip()
+    if "-" in s:
+        lo, hi = s.split("-", 1)
+        return int(lo), int(hi)
+    v = int(s)
+    return v, v
+
+
+def _parse_tag(t):
+    """'3r' -> (3, 'r'); '7c' -> (7, 'c'). Tags are always copied verbatim off a map_block
+    AB-run/CD-run column — check_axes/peek_axes item 3a/3b contract."""
+    t = t.strip()
+    orient = t[-1].lower()
+    if orient not in ("r", "c"):
+        raise ValueError(f"tag '{t}' doesn't end in 'r' or 'c'")
+    return int(t[:-1]), orient
 
 
 def _matches(term, v):
@@ -97,6 +151,28 @@ def _render_grid(symbol_rows, row_labels, col_labels):
     lines = [header]
     for rlabel, srow in zip(row_label_strs, symbol_rows):
         lines.append(rlabel.rjust(row_w) + " " + " ".join(s.rjust(col_w) for s in srow))
+    return "\n".join(lines)
+
+
+def _render_grid_var(symbol_rows, row_labels, col_labels):
+    """Like _render_grid, but each column's width comes from its own content, not just the
+    label — check_axes can render literal cell values of arbitrary width, including
+    multi-word strings with internal spaces, which a label-only column width would misalign.
+    peek_ascii/map_bin don't need this (their content is always 1 or 5 chars, already <= any
+    real label width) and keep using _render_grid unchanged."""
+    row_label_strs = [str(x) for x in row_labels]
+    col_label_strs = [str(x) for x in col_labels]
+    row_w = max((len(s) for s in row_label_strs), default=1)
+    col_w = []
+    for ci, clabel in enumerate(col_label_strs):
+        w = len(clabel)
+        for srow in symbol_rows:
+            w = max(w, len(str(srow[ci])))
+        col_w.append(w)
+    header = " " * row_w + " " + " ".join(s.rjust(w) for s, w in zip(col_label_strs, col_w))
+    lines = [header]
+    for rlabel, srow in zip(row_label_strs, symbol_rows):
+        lines.append(rlabel.rjust(row_w) + " " + " ".join(str(s).rjust(w) for s, w in zip(srow, col_w)))
     return "\n".join(lines)
 
 
@@ -179,6 +255,149 @@ def _find_entry(entries, row, col):
     return None
 
 
+def _is_plain_string(v):
+    return isinstance(v, str) and v.strip() != ""
+
+
+def _is_plain_int_year(v):
+    """A plain int/float-that's-really-an-int in SEQ_YEAR_MIN..MAX — candidate cell for the
+    sequential-year fallback below. Excel bools are ints in Python; excluded explicitly."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)) and float(v).is_integer():
+        iv = int(v)
+        if SEQ_YEAR_MIN <= iv <= SEQ_YEAR_MAX:
+            return iv
+    return None
+
+
+def _seq_hits_1d(seq):
+    """Indices into seq that are part of a maximal run (length >= RUN_LENGTH_THRESHOLD) of
+    consecutive integers each exactly +1 from the previous, within SEQ_YEAR_MIN..MAX — the
+    numeric-typed-year header case (2012 2013 2014 ...), invisible to both is_date_like (no
+    string regex applies to a plain int) and to a fixed year_term match (matches only one
+    cell). Feeds CD-run candidate detection only (wsnSearch5.md item 2) — never touches
+    is_date_like itself or the D/A/B/C tally counts."""
+    hits = set()
+    run_start = None
+    prev_val = None
+    for i, v in enumerate(seq):
+        iv = _is_plain_int_year(v)
+        if iv is not None and prev_val is not None and iv == prev_val + 1:
+            pass  # continues the run already tracked by run_start
+        else:
+            if run_start is not None and i - run_start >= RUN_LENGTH_THRESHOLD:
+                hits.update(range(run_start, i))
+            run_start = i if iv is not None else None
+        prev_val = iv
+    if run_start is not None and len(seq) - run_start >= RUN_LENGTH_THRESHOLD:
+        hits.update(range(run_start, len(seq)))
+    return hits
+
+
+def _precompute_seq_grids(values, r0, r1, c0, c1):
+    """seq_row[(r,cc)]/seq_col[(r,cc)] = True if that cell is part of a qualifying row-wise /
+    col-wise sequential-year run — orientation-specific, one fused pass per orientation, no
+    per-cell re-read (wsnSearch5.md item 2 §2, Tier 2 of the CD-run check)."""
+    seq_row = {}
+    for r in range(r0, r1 + 1):
+        row_vals = [values[r - 1][cc - 1] for cc in range(c0, c1 + 1)]
+        for i in _seq_hits_1d(row_vals):
+            seq_row[(r, c0 + i)] = True
+    seq_col = {}
+    for cc in range(c0, c1 + 1):
+        col_vals = [values[r - 1][cc - 1] for r in range(r0, r1 + 1)]
+        for i in _seq_hits_1d(col_vals):
+            seq_col[(r0 + i, cc)] = True
+    return seq_row, seq_col
+
+
+def _ab_cd_run_candidates(values, r0, r1, c0, c1, metric_term, entity_term, year_term):
+    """map_block's run-detector (wsnSearch5.md item 2). AB-run (lineitem axis): a cell
+    continues the run if it's a metric/entity match or a plain non-blank string; the run
+    qualifies only if it also contains >=1 real metric/entity hit. CD-run (period axis): a
+    cell continues the run if it's date-like (incl. the sequential-int fallback) or a plain
+    non-blank string; qualifies only if it contains >=1 real date-like hit. Both computed
+    per column and per row (an axis can be found as either), pooled into one candidate list
+    per axis type. Returns (ab_candidates, cd_candidates), each a sorted list of
+    (index, 'r'|'c') tuples. Never alters the D/A/B/C tally counts — those stay exactly as
+    map_block computes them today."""
+    seq_row, seq_col = _precompute_seq_grids(values, r0, r1, c0, c1)
+
+    def ab_hit(v):
+        _, metric, entity, _ = _cell_flags(v, metric_term, entity_term, year_term)
+        anchor = metric or entity
+        return (anchor or _is_plain_string(v)), anchor
+
+    def cd_hit(v, r, cc, row_wise):
+        seq_anchor = seq_row.get((r, cc), False) if row_wise else seq_col.get((r, cc), False)
+        anchor = is_date_like(v) or seq_anchor
+        return (anchor or _is_plain_string(v)), anchor
+
+    ab_col, cd_col, ab_row, cd_row = set(), set(), set(), set()
+
+    def _run_pass(outer_range, inner_range, row_wise, out_ab, out_cd):
+        for outer in outer_range:
+            ab_streak = ab_anchor_ct = cd_streak = cd_anchor_ct = 0
+            for inner in inner_range:
+                r, cc = (outer, inner) if row_wise else (inner, outer)
+                v = values[r - 1][cc - 1]
+                hit, anchor = ab_hit(v)
+                if hit:
+                    ab_streak += 1
+                    ab_anchor_ct += anchor
+                else:
+                    if ab_streak >= RUN_LENGTH_THRESHOLD and ab_anchor_ct >= 1:
+                        out_ab.add(outer)
+                    ab_streak = ab_anchor_ct = 0
+                hit, anchor = cd_hit(v, r, cc, row_wise)
+                if hit:
+                    cd_streak += 1
+                    cd_anchor_ct += anchor
+                else:
+                    if cd_streak >= RUN_LENGTH_THRESHOLD and cd_anchor_ct >= 1:
+                        out_cd.add(outer)
+                    cd_streak = cd_anchor_ct = 0
+            if ab_streak >= RUN_LENGTH_THRESHOLD and ab_anchor_ct >= 1:
+                out_ab.add(outer)
+            if cd_streak >= RUN_LENGTH_THRESHOLD and cd_anchor_ct >= 1:
+                out_cd.add(outer)
+
+    _run_pass(range(c0, c1 + 1), range(r0, r1 + 1), False, ab_col, cd_col)
+    _run_pass(range(r0, r1 + 1), range(c0, c1 + 1), True, ab_row, cd_row)
+
+    ab_candidates = sorted([(c, "c") for c in ab_col] + [(r, "r") for r in ab_row])
+    cd_candidates = sorted([(c, "c") for c in cd_col] + [(r, "r") for r in cd_row])
+    return ab_candidates, cd_candidates
+
+
+def _fmt_run_candidates(cands, block_num_str, axis_label, notes_out):
+    """Format one axis-type's (AB-run or CD-run) candidate list into map_block's cell text —
+    <index><r|c>, comma-joined, '-' if none, capped at CANDIDATE_CAP shown. Appends an
+    overflow note (or, past 2x the cap, a stronger 'investigate' note) and/or a mixed-
+    orientation note to notes_out — wsnSearch5.md item 2 §2 step 4."""
+    if not cands:
+        return "-"
+    shown = cands[:CANDIDATE_CAP]
+    s = ",".join(f"{idx}{orient}" for idx, orient in shown)
+    parts = []
+    if len(cands) > 2 * CANDIDATE_CAP:
+        parts.append(
+            f"block {block_num_str} {axis_label} candidate count ({len(cands)}) far exceeds "
+            f"typical header-row counts — investigate, could be false positives"
+        )
+    elif len(cands) > CANDIDATE_CAP:
+        parts.append(f"block {block_num_str} {axis_label} {len(cands) - CANDIDATE_CAP} more candidates not shown")
+    if len({o for _, o in shown}) > 1:
+        parts.append(
+            f"block {block_num_str} {axis_label} candidates mix orientation ({s}) — check both, "
+            f"one is likely a false positive, order is not a nesting signal"
+        )
+    if parts:
+        notes_out.append("; ".join(parts))
+    return s
+
+
 def _trim_to_char_limit(values_out, anchor_index, char_limit):
     """Char safety net for peek_row/peek_col, independent of the span-based windowing —
     fires even inside a <=41 block whose values happen to be long (wsnSearch4.md item 2
@@ -243,9 +462,9 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "metric_term": {"type": "string", "description": "optional fuzzy metric term to count matches for (adds an A count per sheet)"},
-                    "entity_term": {"type": "string", "description": "optional fuzzy entity term to count matches for (adds a B count per sheet)"},
-                    "year_term": {"type": "integer", "description": "optional target year to count matches for (adds a C count per sheet) — anchor to check, not a settled answer"},
+                    "metric_term": {"type": "string", "description": "optional fuzzy metric term to count matches for (adds an A count per sheet). Omit to use the session default set via set_terms."},
+                    "entity_term": {"type": "string", "description": "optional fuzzy entity term to count matches for (adds a B count per sheet). Omit to use the session default set via set_terms."},
+                    "year_term": {"type": "integer", "description": "optional target year to count matches for (adds a C count per sheet) — anchor to check, not a settled answer. Omit to use the session default set via set_terms."},
                 },
                 "required": [],
             },
@@ -271,7 +490,13 @@ TOOLS = [
                 "Default first structural call after list_sheets. Finds every table block on a "
                 "sheet (split by blank columns/rows"
                 "within each band) and renders them as a compact line list: one entry per block, "
-                "or cluster of small blocks. Each entry gives its row/col range and raw D/A/B/C counts within."
+                "or cluster of small blocks. Each entry gives its row/col range, raw D/A/B/C counts "
+                "within, and two more columns, AB-run/CD-run: any unbroken run (length >= 3) of "
+                "lineitem-hits (AB) or period-hits (CD) found in that block, as <index><r|c> "
+                "candidates (comma-joined, '-' if none). If a block shows a candidate in both "
+                "columns, call check_axes directly with those tags/rows/cols — skip blind peek_ascii "
+                "sweeps. If only one column has a candidate, the other axis is often stated once in "
+                "an earlier block sharing the same cols range, not absent from the sheet. "
                 "Call before map_bin — only fall back to map_bin if this flat list doesn't resolve a "
                 "spatial/relative-position question (role-swap headers, transposed axes, adjacent "
                 "column-band comparison)."
@@ -280,9 +505,9 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "sheet": {"type": "string"},
-                    "metric_term": {"type": "string", "description": "optional fuzzy metric term; adds an A count per block"},
-                    "entity_term": {"type": "string", "description": "optional fuzzy entity term; adds a B count per block"},
-                    "year_term": {"type": "integer", "description": "optional target year; adds a C count per block — anchor to check, not a settled answer"},
+                    "metric_term": {"type": "string", "description": "optional fuzzy metric term; adds an A count per block. Omit to use the session default set via set_terms."},
+                    "entity_term": {"type": "string", "description": "optional fuzzy entity term; adds a B count per block. Omit to use the session default set via set_terms."},
+                    "year_term": {"type": "integer", "description": "optional target year; adds a C count per block — anchor to check, not a settled answer. Omit to use the session default set via set_terms."},
                 },
                 "required": ["sheet"],
             },
@@ -307,9 +532,9 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "sheet": {"type": "string"},
-                    "metric_term": {"type": "string", "description": "optional fuzzy metric term; sets the A flag on bins containing a match"},
-                    "entity_term": {"type": "string", "description": "optional fuzzy entity term; sets the B flag on bins containing a match"},
-                    "year_term": {"type": "integer", "description": "optional target year; sets the C flag on bins containing a match — anchor to check, not a settled answer"},
+                    "metric_term": {"type": "string", "description": "optional fuzzy metric term; sets the A flag on bins containing a match. Omit to use the session default set via set_terms."},
+                    "entity_term": {"type": "string", "description": "optional fuzzy entity term; sets the B flag on bins containing a match. Omit to use the session default set via set_terms."},
+                    "year_term": {"type": "integer", "description": "optional target year; sets the C flag on bins containing a match — anchor to check, not a settled answer. Omit to use the session default set via set_terms."},
                 },
                 "required": ["sheet"],
             },
@@ -338,9 +563,9 @@ TOOLS = [
                     "r1": {"type": "integer"},
                     "c0": {"type": "integer"},
                     "c1": {"type": "integer"},
-                    "metric_term": {"type": "string", "description": "optional fuzzy metric term; renders matching cells as 'A'"},
-                    "entity_term": {"type": "string", "description": "optional fuzzy entity term; renders matching cells as 'B'"},
-                    "year_term": {"type": "integer", "description": "optional target year; renders matching cells as 'C' — anchor to check, not a settled answer"},
+                    "metric_term": {"type": "string", "description": "optional fuzzy metric term; renders matching cells as 'A'. Omit to use the session default set via set_terms."},
+                    "entity_term": {"type": "string", "description": "optional fuzzy entity term; renders matching cells as 'B'. Omit to use the session default set via set_terms."},
+                    "year_term": {"type": "integer", "description": "optional target year; renders matching cells as 'C' — anchor to check, not a settled answer. Omit to use the session default set via set_terms."},
                 },
                 "required": ["sheet", "r0", "r1", "c0", "c1"],
             },
@@ -460,6 +685,102 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_terms",
+            "description": (
+                "Fix metric_term/entity_term/year_term once for the rest of this session — "
+                "list_sheets/map_block/map_bin/peek_ascii all fall back to these whenever you omit "
+                "their own term args, so you stop retyping the same strings on every call. Omitting "
+                "an arg here leaves it unchanged; passing an explicit null clears it. Returns the "
+                "full current state (all three, not just what you touched) after applying the call. "
+                "Call this before your first check_axes call — check_axes has no term args of its "
+                "own, it only reads whatever set_terms has set."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "metric_term": {"type": "string", "description": "fuzzy metric term for the rest of this session"},
+                    "entity_term": {"type": "string", "description": "fuzzy entity term for the rest of this session"},
+                    "year_term": {"type": "integer", "description": "target year for the rest of this session"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_axes",
+            "description": (
+                "Confirm a map_block AB-run/CD-run candidate is a real axis before reading its "
+                "values. sheet/tags/rows/cols are copied verbatim off one map_block output row — no "
+                "independent block re-detection. Renders the block (tag-centered, expanded by 20 in "
+                "every direction, clamped only if still over "
+                f"{PEEK_ASCII_MAX_CELLS} cells): any cell in a tagged row or column shows its real "
+                "value (capped to 3 significant figures), every other cell shows peek_ascii's type flag ('.' blank "
+                "'A' metric-match 'B' entity-match 'C' year-match 'D' date-like 'S' string 'N' "
+                "number '?' other). Real row/col numbers label the grid — but on a wide grid, don't "
+                "count grid columns by eye to find a value: the response's separate 'tagged_values' "
+                "field restates every tagged row/column's own values as an explicit "
+                "{column_or_row_index: value} dict, so read the value there, not off the grid. The "
+                "grid itself is for the pattern question (does real data actually line up under both "
+                "axes), not for reading exact values. Also auto-includes the row "
+                "immediately above a tagged row (col immediately left of a tagged col) when it looks "
+                "like a header, even though map_block never flagged it — a coarser nested header "
+                "(year sitting above quarter) is often too sparse for map_block's run detector to "
+                "catch on its own. Uses whatever metric_term/entity_term/year_term set_terms has set "
+                "— call set_terms first, this tool has no term args of its own."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sheet": {"type": "string"},
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "candidate tags copied from map_block's AB-run/CD-run columns, e.g. [\"3r\",\"7c\"]",
+                    },
+                    "rows": {"type": "string", "description": "block's row range copied from map_block, e.g. \"3-6\" or \"3\""},
+                    "cols": {"type": "string", "description": "block's col range copied from map_block, e.g. \"2-7\" or \"2\""},
+                },
+                "required": ["sheet", "tags", "rows", "cols"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "peek_axes",
+            "description": (
+                "Read a confirmed candidate axis's own real values — no grid, no flagging. "
+                "sheet/tags/rows/cols are copied verbatim off a map_block row, same as check_axes, "
+                "but here rows/cols only bound the scan range per tag, they don't define a rendered "
+                "window. For each tag, scans its full line (the tagged row across cols, or the "
+                "tagged column across rows) and returns non-blank values only as {index: value} "
+                "(3 significant figures), one line per tag, each with its own independent truncation cap — "
+                "nothing auto-added beyond what you asked for. Use once a candidate's confirmed (via "
+                "check_axes, or trusted directly when map_block returned only one clean candidate) — "
+                "cheaper than check_axes for a huge block, since a row's/column's own real values "
+                "stay small even when the block itself is huge, and this tool never renders a grid."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sheet": {"type": "string"},
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "candidate tags copied from map_block's AB-run/CD-run columns, e.g. [\"3r\",\"4r\"]",
+                    },
+                    "rows": {"type": "string", "description": "scan-range bound copied from map_block, e.g. \"3-14\" or \"3\""},
+                    "cols": {"type": "string", "description": "scan-range bound copied from map_block, e.g. \"3-18\" or \"3\""},
+                },
+                "required": ["sheet", "tags", "rows", "cols"],
+            },
+        },
+    },
 ]
 
 
@@ -481,6 +802,20 @@ def load_env(path):
 class Workbook:
     def __init__(self, path):
         self.wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        # Session-scoped query terms — wsnSearch5.md item 4. None until set_terms is called,
+        # identical to today's behavior for any term-consuming tool called before it.
+        self._metric_term = None
+        self._entity_term = None
+        self._year_term = None
+
+    def set_terms(self, metric_term=_UNSET, entity_term=_UNSET, year_term=_UNSET):
+        if metric_term is not _UNSET:
+            self._metric_term = metric_term
+        if entity_term is not _UNSET:
+            self._entity_term = entity_term
+        if year_term is not _UNSET:
+            self._year_term = year_term
+        return {"metric_term": self._metric_term, "entity_term": self._entity_term, "year_term": self._year_term}
 
     def _check_visible(self, sheet):
         if sheet not in self.wb.sheetnames:
@@ -499,7 +834,10 @@ class Workbook:
         n_cols = len(values[0]) if n_rows else 0
         return values, n_rows, n_cols, true_max_row, true_max_col
 
-    def list_sheets(self, metric_term=None, entity_term=None, year_term=None):
+    def list_sheets(self, metric_term=_UNSET, entity_term=_UNSET, year_term=_UNSET):
+        metric_term = _resolve_term(metric_term, self._metric_term)
+        entity_term = _resolve_term(entity_term, self._entity_term)
+        year_term = _resolve_term(year_term, self._year_term)
         results = []
         clamped_sheets = []
         for name in self.wb.sheetnames:
@@ -541,7 +879,10 @@ class Workbook:
             "note": "upper bound only; formatting artifacts often overstate real extent — confirm with map_block or map_bin",
         }
 
-    def map_block(self, sheet, metric_term=None, entity_term=None, year_term=None):
+    def map_block(self, sheet, metric_term=_UNSET, entity_term=_UNSET, year_term=_UNSET):
+        metric_term = _resolve_term(metric_term, self._metric_term)
+        entity_term = _resolve_term(entity_term, self._entity_term)
+        year_term = _resolve_term(year_term, self._year_term)
         self._check_visible(sheet)
         values, n_rows, n_cols, true_max_row, true_max_col = self._scan(sheet)
         if not n_cols:
@@ -551,6 +892,7 @@ class Workbook:
         entries = _merge_blocks(zones)
 
         rows_out = []
+        block_notes = []
         for e in entries:
             num_str = str(e["nums"][0]) if len(e["nums"]) == 1 else f"{e['nums'][0]}-{e['nums'][-1]}"
             r0, r1 = e["rows"]
@@ -563,25 +905,42 @@ class Workbook:
                     a += metric
                     b += entity
                     c += year
+
+            ab_cands, cd_cands = _ab_cd_run_candidates(values, r0, r1, c0, c1, metric_term, entity_term, year_term)
+            ab_str = _fmt_run_candidates(ab_cands, num_str, "AB-run", block_notes)
+            cd_str = _fmt_run_candidates(cd_cands, num_str, "CD-run", block_notes)
+
             rows_out.append([
                 num_str,
                 str(r0) if r0 == r1 else f"{r0}-{r1}",
                 str(c0) if c0 == c1 else f"{c0}-{c1}",
-                d, a, b, c,
+                d, a, b, c, ab_str, cd_str,
             ])
 
-        table = _render_table(["block", "rows", "cols", "D", "A", "B", "C"], rows_out)
+        table = _render_table(["block", "rows", "cols", "D", "A", "B", "C", "AB-run", "CD-run"], rows_out)
         result = {
             "blocks": table,
-            "legend": "D date-like count  A metric-match count  B entity-match count  C year-match count — raw counts over each entry's true row/col extent",
+            "legend": (
+                "D date-like count  A metric-match count  B entity-match count  C year-match count — "
+                "raw counts over each entry's true row/col extent. AB-run/CD-run: <index><r|c> of any "
+                "unbroken run (length >= 3) of lineitem-hits (AB) / period-hits (CD) found in that "
+                "block, comma-joined, '-' if none. A block with a candidate in one column but '-' in "
+                "the other often has the missing axis stated once in an earlier block sharing the "
+                "same cols range, not absent from the sheet."
+            ),
             "scanned_rows": n_rows,
             "scanned_cols": n_cols,
         }
+        if block_notes:
+            result["notes"] = block_notes
         if true_max_row > n_rows:
             result["note"] = f"{sheet} not fully scanned, {true_max_row - n_rows} rows remaining"
         return result
 
-    def map_bin(self, sheet, metric_term=None, entity_term=None, year_term=None):
+    def map_bin(self, sheet, metric_term=_UNSET, entity_term=_UNSET, year_term=_UNSET):
+        metric_term = _resolve_term(metric_term, self._metric_term)
+        entity_term = _resolve_term(entity_term, self._entity_term)
+        year_term = _resolve_term(year_term, self._year_term)
         self._check_visible(sheet)
         values, n_rows, n_cols, true_max_row, true_max_col = self._scan(sheet)
         if not n_cols:
@@ -641,7 +1000,10 @@ class Workbook:
             result["note"] = f"{sheet} not fully scanned, {true_max_row - n_rows} rows remaining"
         return result
 
-    def peek_ascii(self, sheet, r0, r1, c0, c1, metric_term=None, entity_term=None, year_term=None):
+    def peek_ascii(self, sheet, r0, r1, c0, c1, metric_term=_UNSET, entity_term=_UNSET, year_term=_UNSET):
+        metric_term = _resolve_term(metric_term, self._metric_term)
+        entity_term = _resolve_term(entity_term, self._entity_term)
+        year_term = _resolve_term(year_term, self._year_term)
         self._check_visible(sheet)
         r1c, c1c, note = _clamp_window(r0, r1, c0, c1, PEEK_ASCII_MAX_CELLS)
         ws = self.wb[sheet]
@@ -661,7 +1023,7 @@ class Workbook:
         r1c, c1c, note = _clamp_window(r0, r1, c0, c1, PEEK_MAX_CELLS)
         ws = self.wb[sheet]
         rows = list(ws.iter_rows(min_row=r0, max_row=r1c, min_col=c0, max_col=c1c, values_only=True))
-        result = {"rows": {r0 + i: {c0 + j: v for j, v in enumerate(row)} for i, row in enumerate(rows)}}
+        result = {"rows": {r0 + i: {c0 + j: _round_display(v) for j, v in enumerate(row)} for i, row in enumerate(rows)}}
         error_count = sum(1 for row in rows for v in row if is_excel_error(v))
         if error_count:
             result["warning"] = (
@@ -725,13 +1087,13 @@ class Workbook:
             for r in range(lo, hi + 1):
                 v = values[r - 1][col - 1]
                 if v is not None:
-                    values_out[r] = v
+                    values_out[r] = _round_display(v)
             anchor_index = row
         else:
             for cc in range(lo, hi + 1):
                 v = values[row - 1][cc - 1]
                 if v is not None:
-                    values_out[cc] = v
+                    values_out[cc] = _round_display(v)
             anchor_index = col
 
         values_out, trim_note = _trim_to_char_limit(values_out, anchor_index, PEEK_AXIS_CHAR_LIMIT)
@@ -768,7 +1130,7 @@ class Workbook:
         else:
             return {"error": "kind must be 'row' or 'col'"}
 
-        values = {i + 1: v for i, v in enumerate(vals) if v is not None}
+        values = {i + 1: _round_display(v) for i, v in enumerate(vals) if v is not None}
         if len(values) > AXIS_VALUE_CAP:
             total_found = len(values)
             keep = sorted(values.keys())[:AXIS_VALUE_CAP]
@@ -799,11 +1161,169 @@ class Workbook:
         self._check_visible(sheet)
         ws = self.wb[sheet]
         v = list(ws.iter_rows(min_row=row, max_row=row, min_col=col, max_col=col, values_only=True))[0][0]
-        result = {"value": v}
+        result = {"value": _round_display(v)}
         if is_excel_error(v):
             result["error"] = True
             result["note"] = "this is a formula error, likely a broken external data link (e.g. disconnected Bloomberg add-in), not real data"
         return result
+
+    def check_axes(self, sheet, tags, rows, cols):
+        """wsnSearch5.md item 3a. tags/rows/cols are copied verbatim off one map_block output
+        row — no independent block re-detection. Renders the whole block, tag-centered and
+        clamped only if over PEEK_ASCII_MAX_CELLS: tagged rows/cols show literal values,
+        everything else shows peek_ascii's type flag. Reads metric_term/entity_term/year_term
+        from session state (set_terms) unconditionally — no term params of its own."""
+        self._check_visible(sheet)
+        r0, r1 = _parse_range(rows)
+        c0, c1 = _parse_range(cols)
+        values, n_rows, n_cols, true_max_row, true_max_col = self._scan(sheet)
+        r1 = min(r1, n_rows)
+        c1 = min(c1, n_cols)
+        metric_term, entity_term, year_term = self._metric_term, self._entity_term, self._year_term
+
+        parsed = [_parse_tag(t) for t in tags]
+        row_tags = sorted({idx for idx, orient in parsed if orient == "r"})
+        col_tags = sorted({idx for idx, orient in parsed if orient == "c"})
+        if not row_tags and not col_tags:
+            return {"grid": "", "note": "no valid tags parsed"}
+
+        def _is_header_like(v):
+            return _cell_code(v, metric_term, entity_term, year_term) in ("D", "S")
+
+        notes = []
+        extra_rows = []
+        for idx in row_tags:
+            above = idx - 1
+            if above < r0 or above in row_tags or above in extra_rows:
+                continue
+            line = [values[above - 1][cc - 1] for cc in range(c0, c1 + 1)]
+            if any(v is not None for v in line) and any(_is_header_like(v) for v in line):
+                extra_rows.append(above)
+                notes.append(f"row {above} included above requested row {idx} — header content detected, not itself a requested tag")
+
+        extra_cols = []
+        for idx in col_tags:
+            left = idx - 1
+            if left < c0 or left in col_tags or left in extra_cols:
+                continue
+            line = [values[r - 1][left - 1] for r in range(r0, r1 + 1)]
+            if any(v is not None for v in line) and any(_is_header_like(v) for v in line):
+                extra_cols.append(left)
+                notes.append(f"col {left} included left of requested col {idx} — header content detected, not itself a requested tag")
+
+        all_row_lines = sorted(set(row_tags) | set(extra_rows))
+        all_col_lines = sorted(set(col_tags) | set(extra_cols))
+
+        # Tag-centered bounding box (wsnSearch5.md item 3a §2 step 7 "Concrete fix"): an
+        # orientation with no tags at all defaults to the block's full range for that axis —
+        # "always whole block", not span-by-tag-composition.
+        box_r0, box_r1 = (min(all_row_lines), max(all_row_lines)) if all_row_lines else (r0, r1)
+        box_c0, box_c1 = (min(all_col_lines), max(all_col_lines)) if all_col_lines else (c0, c1)
+
+        win_r0 = max(r0, box_r0 - PEEK_AXIS_WINDOW_RADIUS)
+        win_r1 = min(r1, box_r1 + PEEK_AXIS_WINDOW_RADIUS)
+        win_c0 = max(c0, box_c0 - PEEK_AXIS_WINDOW_RADIUS)
+        win_c1 = min(c1, box_c1 + PEEK_AXIS_WINDOW_RADIUS)
+
+        if (win_r1 - win_r0 + 1) * (win_c1 - win_c0 + 1) > PEEK_ASCII_MAX_CELLS:
+            win_r1, win_c1, clamp_note = _clamp_window(win_r0, win_r1, win_c0, win_c1, PEEK_ASCII_MAX_CELLS)
+            if clamp_note:
+                notes.append(clamp_note)
+
+        row_line_set = set(all_row_lines)
+        col_line_set = set(all_col_lines)
+        symbol_rows = []
+        for r in range(win_r0, win_r1 + 1):
+            row_is_tagged = r in row_line_set
+            srow = []
+            for cc in range(win_c0, win_c1 + 1):
+                v = values[r - 1][cc - 1]
+                if row_is_tagged or cc in col_line_set:
+                    srow.append(_round_display(v) if v is not None else ".")
+                else:
+                    srow.append(_cell_code(v, metric_term, entity_term, year_term))
+            symbol_rows.append(srow)
+
+        grid = _render_grid_var(symbol_rows, list(range(win_r0, win_r1 + 1)), list(range(win_c0, win_c1 + 1)))
+
+        # Tagged-line values, restated as an explicit {index: value} dict per line — same shape
+        # peek_axes already uses. The grid's own literal cells answer "does real data line up
+        # under both axes" (a visual/pattern question); this answers "what is the value at column
+        # N" without requiring a count across the grid's header to find column N in the first
+        # place. Wide tagged columns (a long literal label, or several 20-char datetime columns)
+        # spread the header's index numbers unevenly, which measurably caused exactly this
+        # miscount in testing (wsnSearch5_testlog.md) — this listing is the fix, not a cosmetic
+        # addition. Bounded by the same rendered window as the grid, so it can't blow past
+        # PEEK_ASCII_MAX_CELLS on its own.
+        tagged_lines = []
+        for r in sorted(row_line_set):
+            d = {}
+            for cc in range(win_c0, win_c1 + 1):
+                v = values[r - 1][cc - 1]
+                if v is not None:
+                    d[cc] = _round_display(v)
+            tagged_lines.append(f"{r}r: {d}")
+        for cc in sorted(col_line_set):
+            d = {}
+            for r in range(win_r0, win_r1 + 1):
+                v = values[r - 1][cc - 1]
+                if v is not None:
+                    d[r] = _round_display(v)
+            tagged_lines.append(f"{cc}c: {d}")
+
+        result = {
+            "grid": grid,
+            "tagged_values": "\n".join(tagged_lines),
+            "legend": (
+                "tagged rows/cols show their real value (3 significant figures) in the grid; every "
+                "other cell shows peek_ascii's type flag — . blank  A metric-match  B entity-match  "
+                "C year-match  D date-like  S string  N number  ? other. tagged_values restates "
+                "each tagged row/col's own values as an explicit {column_or_row_index: value} dict — "
+                "use it to read the actual value at a given index, don't count grid columns by eye."
+            ),
+        }
+        if notes:
+            result["note"] = "; ".join(notes)
+        return result
+
+    def peek_axes(self, sheet, tags, rows, cols):
+        """wsnSearch5.md item 3b. Same sourcing convention as check_axes, but rows/cols only
+        bound the scan range per tag — no rendered window, no flagging, no term dependency.
+        Sparse {index: value} dict per tag, independent AXIS_VALUE_CAP truncation each."""
+        self._check_visible(sheet)
+        r0, r1 = _parse_range(rows)
+        c0, c1 = _parse_range(cols)
+        values, n_rows, n_cols, true_max_row, true_max_col = self._scan(sheet)
+        r1 = min(r1, n_rows)
+        c1 = min(c1, n_cols)
+
+        lines = []
+        for t in tags:
+            idx, orient = _parse_tag(t)
+            line_values = {}
+            if orient == "r":
+                for cc in range(c0, c1 + 1):
+                    v = values[idx - 1][cc - 1]
+                    if v is not None:
+                        line_values[cc] = _round_display(v)
+            else:
+                for r in range(r0, r1 + 1):
+                    v = values[r - 1][idx - 1]
+                    if v is not None:
+                        line_values[r] = _round_display(v)
+            note = None
+            if len(line_values) > AXIS_VALUE_CAP:
+                total_found = len(line_values)
+                keep = sorted(line_values.keys())[:AXIS_VALUE_CAP]
+                line_values = {k: line_values[k] for k in keep}
+                note = f"too many values! truncated to {AXIS_VALUE_CAP} of {total_found} found"
+            lines.append((t, line_values, note))
+
+        text = "\n".join(
+            f"{t}: {vals}" + (f"  note: {note}" if note else "")
+            for t, vals, note in lines
+        )
+        return {"axes": text}
 
 
 def call_deepseek(api_key, model, messages):
@@ -838,6 +1358,9 @@ def run(task, model, xlsx_path, max_tool_calls=MAX_TOOL_CALLS):
         "peek_row": lambda **kw: workbook.peek_row(**kw),
         "all_axis": lambda **kw: workbook.all_axis(**kw),
         "read_cell": lambda **kw: workbook.read_cell(**kw),
+        "set_terms": lambda **kw: workbook.set_terms(**kw),
+        "check_axes": lambda **kw: workbook.check_axes(**kw),
+        "peek_axes": lambda **kw: workbook.peek_axes(**kw),
     }
 
     system_prompt = "Follow this protocol exactly. Use only the tools provided.\n\n" + protocol
