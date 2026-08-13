@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 date created: 2026-08-04
-date updated: 2026-08-11
-date surroundings last checked: 2026-08-11
+date updated: 2026-08-13
+date surroundings last checked: 2026-08-13
 """
 import json
 import math
@@ -41,6 +41,11 @@ BLOCK_MERGE_MAX_ROWSUM = 20
 # map_block's AB-run/CD-run detector — wsnSearch5.md item 2.
 RUN_LENGTH_THRESHOLD = 3
 CANDIDATE_CAP = 5
+# find_matches per-term match cap — wsnSearch6.md item 4. Distinct from CANDIDATE_CAP (5,
+# map_block's AB-run/CD-run candidate cap) and AXIS_VALUE_CAP (500, all_axis/peek_axes) — a
+# genuine single-entity search should return single digits; hitting 100 is itself a signal
+# the term is too generic, not a result worth preserving more of.
+FIND_MATCHES_CAP = 100
 SEQ_YEAR_MIN, SEQ_YEAR_MAX = 1980, 2035
 # Display formatting only — wsnSearch5.md item 1. Significant figures, not decimal places: a
 # fixed decimal-place cap keeps 7 sig figs on a value like 446.08 but only 1-2 on a sub-1 value
@@ -82,6 +87,20 @@ def _resolve_term(explicit, stored):
     item 4. Omitted at call time (_UNSET) falls back to the set_terms default; an explicit
     value (including None) applies to this call only and doesn't touch the stored default."""
     return stored if explicit is _UNSET else explicit
+
+
+def _prep_candidates(term, label, notes_out):
+    """wsnSearch6.md item 2: metric_term/entity_term may be a list of candidate strings
+    (term-probe) instead of a single string. Returns the (possibly capped) list to probe, or
+    None if term isn't a list at all — the caller falls back to its existing single-term
+    counting path unchanged. Reuses CANDIDATE_CAP (5), the same cap map_block's AB-run/CD-run
+    candidate lists already use, rather than a new constant for the same kind of guard."""
+    if not isinstance(term, list):
+        return None
+    if len(term) > CANDIDATE_CAP:
+        notes_out.append(f"{label} candidates truncated to {CANDIDATE_CAP} of {len(term)}")
+        return term[:CANDIDATE_CAP]
+    return term
 
 
 def _parse_range(s):
@@ -462,8 +481,32 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "metric_term": {"type": "string", "description": "optional fuzzy metric term to count matches for (adds an A count per sheet). Omit to use the session default set via set_terms."},
-                    "entity_term": {"type": "string", "description": "optional fuzzy entity term to count matches for (adds a B count per sheet). Omit to use the session default set via set_terms."},
+                    "metric_term": {
+                        "anyOf": [
+                            {"type": "string"},
+                            {"type": "array", "items": {"type": "string"}, "maxItems": CANDIDATE_CAP},
+                        ],
+                        "description": (
+                            "optional fuzzy metric term to count matches for (adds an A count per "
+                            "sheet) — either one string, or a list of up to 5 candidate strings to "
+                            "test several word choices in one scan when you're unsure of the sheet's "
+                            "own wording (adds an A count per candidate instead of one total). Omit "
+                            "to use the session default set via set_terms."
+                        ),
+                    },
+                    "entity_term": {
+                        "anyOf": [
+                            {"type": "string"},
+                            {"type": "array", "items": {"type": "string"}, "maxItems": CANDIDATE_CAP},
+                        ],
+                        "description": (
+                            "optional fuzzy entity term to count matches for (adds a B count per "
+                            "sheet) — either one string, or a list of up to 5 candidate strings to "
+                            "test several word choices in one scan when you're unsure of the sheet's "
+                            "own wording (adds a B count per candidate instead of one total). Omit "
+                            "to use the session default set via set_terms."
+                        ),
+                    },
                     "year_term": {"type": "integer", "description": "optional target year to count matches for (adds a C count per sheet) — anchor to check, not a settled answer. Omit to use the session default set via set_terms."},
                 },
                 "required": [],
@@ -568,6 +611,40 @@ TOOLS = [
                     "year_term": {"type": "integer", "description": "optional target year; renders matching cells as 'C' — anchor to check, not a settled answer. Omit to use the session default set via set_terms."},
                 },
                 "required": ["sheet", "r0", "r1", "c0", "c1"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_matches",
+            "description": (
+                "Exact [row, col, value] coordinates for a term, when map_block/map_bin narrowed "
+                "you to 'somewhere in this block/region' but not further (a large or sparse sheet, "
+                "several scattered candidate rows). Returns one key per term actually set — 'A' for "
+                "metric_term, 'B' for entity_term, 'C' for year_term — each a list of "
+                "[row, col, value] triples; a term left unset contributes no key. D (date-like) is "
+                "never returned, it's structural, not something you search for. Single-term only, "
+                "no cross-term matching — it won't find 'the row where the entity and date both "
+                "match,' only where each term matches on its own; cross-check candidate rows "
+                "yourself with peek_row/read_cell. r0/r1/c0/c1 each default independently to the "
+                "sheet's scanned extent — narrow just the rows, just the columns, both, or neither. "
+                f"Capped at {FIND_MATCHES_CAP} matches per term — past that the term is too generic "
+                "for a search to be useful; a note says when this fired."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sheet": {"type": "string"},
+                    "r0": {"type": "integer", "description": "optional row lower bound. Default is the sheet's scanned minimum (1)."},
+                    "r1": {"type": "integer", "description": "optional row upper bound. Default is the sheet's scanned maximum."},
+                    "c0": {"type": "integer", "description": "optional col lower bound. Default is the sheet's scanned minimum (1)."},
+                    "c1": {"type": "integer", "description": "optional col upper bound. Default is the sheet's scanned maximum."},
+                    "metric_term": {"type": "string", "description": "optional fuzzy metric term. Omit to use the session default set via set_terms."},
+                    "entity_term": {"type": "string", "description": "optional fuzzy entity term. Omit to use the session default set via set_terms."},
+                    "year_term": {"type": "integer", "description": "optional target year. Omit to use the session default set via set_terms."},
+                },
+                "required": ["sheet"],
             },
         },
     },
@@ -838,6 +915,15 @@ class Workbook:
         metric_term = _resolve_term(metric_term, self._metric_term)
         entity_term = _resolve_term(entity_term, self._entity_term)
         year_term = _resolve_term(year_term, self._year_term)
+
+        # wsnSearch6.md item 2: metric_term/entity_term may each be a list of candidate
+        # strings (term-probe) instead of one string — one _scan() per sheet either way, just
+        # an inner loop over already-materialized cell values. year_term stays single-value
+        # only (see wsnSearch6.md item 2 assumptions).
+        top_notes = []
+        metric_cands = _prep_candidates(metric_term, "metric_term", top_notes)
+        entity_cands = _prep_candidates(entity_term, "entity_term", top_notes)
+
         results = []
         clamped_sheets = []
         for name in self.wb.sheetnames:
@@ -846,18 +932,34 @@ class Workbook:
                 continue
             values, n_rows, n_cols, true_max_row, true_max_col = self._scan(name)
             entry = {"name": name, "scanned_rows": n_rows, "scanned_cols": n_cols}
-            d = a = b = c = 0
+            d = 0
+            a = {cand: 0 for cand in metric_cands} if metric_cands is not None else 0
+            b = {cand: 0 for cand in entity_cands} if entity_cands is not None else 0
+            c = 0
             for row in values:
                 for v in row:
-                    date, metric, entity, year = _cell_flags(v, metric_term, entity_term, year_term)
-                    d += date
-                    a += metric
-                    b += entity
-                    c += year
+                    if v is None:
+                        continue
+                    if is_date_like(v):
+                        d += 1
+                    if metric_cands is not None:
+                        for cand in metric_cands:
+                            if _matches(cand, v):
+                                a[cand] += 1
+                    elif _matches(metric_term, v):
+                        a += 1
+                    if entity_cands is not None:
+                        for cand in entity_cands:
+                            if _matches(cand, v):
+                                b[cand] += 1
+                    elif _matches(entity_term, v):
+                        b += 1
+                    if _year_matches(year_term, v):
+                        c += 1
             entry["D"] = d
-            if metric_term is not None:
+            if metric_cands is not None or metric_term is not None:
                 entry["A"] = a
-            if entity_term is not None:
+            if entity_cands is not None or entity_term is not None:
                 entry["B"] = b
             if year_term is not None:
                 entry["C"] = c
@@ -868,6 +970,8 @@ class Workbook:
         output = {"sheets": results}
         if clamped_sheets:
             output["sheets_not_fully_scanned"] = clamped_sheets
+        if top_notes:
+            output["notes"] = top_notes
         return output
 
     def get_dims(self, sheet):
@@ -893,6 +997,7 @@ class Workbook:
 
         rows_out = []
         block_notes = []
+        omitted_count = 0
         for e in entries:
             num_str = str(e["nums"][0]) if len(e["nums"]) == 1 else f"{e['nums'][0]}-{e['nums'][-1]}"
             r0, r1 = e["rows"]
@@ -910,12 +1015,23 @@ class Workbook:
             ab_str = _fmt_run_candidates(ab_cands, num_str, "AB-run", block_notes)
             cd_str = _fmt_run_candidates(cd_cands, num_str, "CD-run", block_notes)
 
+            # wsnSearch6.md item 1: a block with no signal at all under the current terms is
+            # dropped from the table rather than shown as an all-zero/all-dash row. Block
+            # numbers keep their original numbering — gaps in the sequence are the omission
+            # signal, not a renumbering pass.
+            if d == 0 and a == 0 and b == 0 and c == 0 and ab_str == "-" and cd_str == "-":
+                omitted_count += 1
+                continue
+
             rows_out.append([
                 num_str,
                 str(r0) if r0 == r1 else f"{r0}-{r1}",
                 str(c0) if c0 == c1 else f"{c0}-{c1}",
                 d, a, b, c, ab_str, cd_str,
             ])
+
+        if omitted_count:
+            block_notes.append(f"{omitted_count} block{'s' if omitted_count != 1 else ''} omitted, no matches")
 
         table = _render_table(["block", "rows", "cols", "D", "A", "B", "C", "AB-run", "CD-run"], rows_out)
         result = {
@@ -1255,20 +1371,36 @@ class Workbook:
         # miscount in testing (wsnSearch5_testlog.md) — this listing is the fix, not a cosmetic
         # addition. Bounded by the same rendered window as the grid, so it can't blow past
         # PEEK_ASCII_MAX_CELLS on its own.
+        # wsnSearch6.md item 7: a tagged line's own tagged_values entry is never cut short by
+        # the grid's render clamp — it scans the block's full row/col extent (r0/r1/c0/c1, not
+        # the windowed/clamped win_r0/win_r1/win_c0/win_c1 the grid rendered) and gets its own
+        # independent AXIS_VALUE_CAP truncation instead, same convention peek_axes already
+        # uses. Applies equally to explicitly-requested tags and to a header row/col
+        # auto-included above/left — no distinction between the two for this guarantee.
         tagged_lines = []
         for r in sorted(row_line_set):
             d = {}
-            for cc in range(win_c0, win_c1 + 1):
+            for cc in range(c0, c1 + 1):
                 v = values[r - 1][cc - 1]
                 if v is not None:
                     d[cc] = _round_display(v)
+            if len(d) > AXIS_VALUE_CAP:
+                total_found = len(d)
+                keep = sorted(d.keys())[:AXIS_VALUE_CAP]
+                d = {k: d[k] for k in keep}
+                notes.append(f"{r}r tagged_values truncated to {AXIS_VALUE_CAP} of {total_found} found")
             tagged_lines.append(f"{r}r: {d}")
         for cc in sorted(col_line_set):
             d = {}
-            for r in range(win_r0, win_r1 + 1):
+            for r in range(r0, r1 + 1):
                 v = values[r - 1][cc - 1]
                 if v is not None:
                     d[r] = _round_display(v)
+            if len(d) > AXIS_VALUE_CAP:
+                total_found = len(d)
+                keep = sorted(d.keys())[:AXIS_VALUE_CAP]
+                d = {k: d[k] for k in keep}
+                notes.append(f"{cc}c tagged_values truncated to {AXIS_VALUE_CAP} of {total_found} found")
             tagged_lines.append(f"{cc}c: {d}")
 
         result = {
@@ -1325,6 +1457,57 @@ class Workbook:
         )
         return {"axes": text}
 
+    def find_matches(self, sheet, r0=None, r1=None, c0=None, c1=None,
+                      metric_term=_UNSET, entity_term=_UNSET, year_term=_UNSET):
+        """wsnSearch6.md item 4. Exact [row, col, value] coordinates per term over a window,
+        single-term matching only — no cross-term AND. D excluded, it's structural, not
+        something searched for. Reuses the same _scan()-materialized grid map_block/map_bin/
+        list_sheets already build, no extra sheet read."""
+        metric_term = _resolve_term(metric_term, self._metric_term)
+        entity_term = _resolve_term(entity_term, self._entity_term)
+        year_term = _resolve_term(year_term, self._year_term)
+        self._check_visible(sheet)
+        values, n_rows, n_cols, true_max_row, true_max_col = self._scan(sheet)
+
+        # Each bound defaults independently to the scanned extent (wsnSearch6.md item 4 §2
+        # step 1) — narrowing one axis doesn't force the other to narrow too.
+        r0 = max(1, r0) if r0 is not None else 1
+        r1 = min(n_rows, r1) if r1 is not None else n_rows
+        c0 = max(1, c0) if c0 is not None else 1
+        c1 = min(n_cols, c1) if c1 is not None else n_cols
+
+        matches = {"A": [], "B": [], "C": []}
+        for r in range(r0, r1 + 1):
+            for cc in range(c0, c1 + 1):
+                v = values[r - 1][cc - 1]
+                if v is None:
+                    continue
+                if metric_term is not None and _matches(metric_term, v):
+                    matches["A"].append([r, cc, _round_display(v)])
+                if entity_term is not None and _matches(entity_term, v):
+                    matches["B"].append([r, cc, _round_display(v)])
+                if year_term is not None and _year_matches(year_term, v):
+                    matches["C"].append([r, cc, _round_display(v)])
+
+        terms = {"A": metric_term, "B": entity_term, "C": year_term}
+        labels = {"A": "metric", "B": "entity", "C": "year"}
+        result = {}
+        notes = []
+        for key in ("A", "B", "C"):
+            if terms[key] is None:
+                continue
+            hits = matches[key]
+            if len(hits) > FIND_MATCHES_CAP:
+                total_found = len(hits)
+                hits = hits[:FIND_MATCHES_CAP]
+                notes.append(f"{labels[key]} matches truncated to {FIND_MATCHES_CAP} of {total_found} found")
+            result[key] = hits
+        if notes:
+            result["notes"] = notes
+        if true_max_row > n_rows:
+            result["note"] = f"{sheet} not fully scanned, {true_max_row - n_rows} rows remaining"
+        return result
+
 
 def call_deepseek(api_key, model, messages):
     resp = requests.post(
@@ -1361,6 +1544,7 @@ def run(task, model, xlsx_path, max_tool_calls=MAX_TOOL_CALLS):
         "set_terms": lambda **kw: workbook.set_terms(**kw),
         "check_axes": lambda **kw: workbook.check_axes(**kw),
         "peek_axes": lambda **kw: workbook.peek_axes(**kw),
+        "find_matches": lambda **kw: workbook.find_matches(**kw),
     }
 
     system_prompt = "Follow this protocol exactly. Use only the tools provided.\n\n" + protocol
